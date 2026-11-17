@@ -1,0 +1,11 @@
+{
+  "name": "FileBrowser Quantum",
+  "author": "BAYUNZIYUE",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["filebrowser", "file-manager", "webdav", "utility"],
+    "description": "Install, run, update and stop FileBrowser Quantum on your Steam Deck. Downloads the static binary straight from the upstream GitHub releases.",
+    "image": "https://raw.githubusercontent.com/BAYUNZIYUE/decky-filebrowser-quantum/main/assets/store-image.png"
+  }
+}

@@ -1,0 +1,6 @@
+node_modules/
+*.pyc
+__pycache__/
+.vscode/
+.pnpm-store/
+dist/index.js.map

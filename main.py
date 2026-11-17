@@ -1,0 +1,838 @@
+"""Decky Loader backend for FileBrowser Quantum.
+
+The plugin is only a manager: it downloads the upstream single-file binary from
+GitHub releases, writes its YAML config, starts/stops it as a detached process
+and keeps it up to date. The actual web server is FileBrowser Quantum itself.
+
+Upstream: https://github.com/gtsteffaniak/filebrowser
+"""
+
+import asyncio
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import time
+import urllib.error
+import urllib.request
+
+import decky
+
+PLUGIN_VERSION = "0.1.0"
+GITHUB_REPO = "gtsteffaniak/filebrowser"
+ASSET_PREFIX = "linux-amd64"
+UA = "decky-filebrowser-quantum/" + PLUGIN_VERSION
+
+# FBQ_HOME exists only so the backend can be exercised outside Decky (tests).
+_HOME_OVERRIDE = os.environ.get("FBQ_HOME")
+RUNTIME_DIR = _HOME_OVERRIDE or decky.DECKY_PLUGIN_RUNTIME_DIR
+SETTINGS_DIR = os.environ.get("FBQ_SETTINGS") or decky.DECKY_PLUGIN_SETTINGS_DIR
+USER_HOME = os.environ.get("FBQ_USER_HOME") or decky.DECKY_USER_HOME
+
+BIN_DIR = os.path.join(RUNTIME_DIR, "bin")
+BIN_PATH = os.path.join(BIN_DIR, "filebrowser")
+DATA_DIR = os.path.join(RUNTIME_DIR, "data")
+CACHE_DIR = os.path.join(RUNTIME_DIR, "cache")
+CONFIG_PATH = os.path.join(RUNTIME_DIR, "config.yaml")
+LOG_PATH = os.path.join(RUNTIME_DIR, "filebrowser.log")
+STATE_PATH = os.path.join(RUNTIME_DIR, "state.json")
+SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
+TMP_DOWNLOAD = os.path.join(BIN_DIR, ".download.part")
+
+DEFAULT_SETTINGS = {
+    "port": 8082,
+    "listen_lan": False,
+    "source_path": "",          # empty -> user home
+    "source_name": "Steam Deck",
+    "admin_username": "admin",
+    "admin_password": "",       # empty -> generated at install time
+    "no_auth": False,
+    "auto_start": True,
+    "channel": "stable",        # stable -> tags containing "stable", latest -> newest
+}
+
+MAX_LOG_TAIL = 200
+
+
+# --------------------------------------------------------------------------- #
+# small helpers
+# --------------------------------------------------------------------------- #
+def _now() -> int:
+    return int(time.time())
+
+
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 256), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _gen_password() -> str:
+    alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+    return "-".join(
+        "".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(3)
+    )
+
+
+def _version_tuple(value: str):
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", value or "")
+    if not m:
+        return (0, 0, 0)
+    return tuple(int(x) for x in m.groups())
+
+
+def _yaml_str(value) -> str:
+    # JSON string literals are valid YAML double-quoted scalars.
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _atomic_write(path: str, text: str, mode: int = 0o644) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------- #
+class Plugin:
+    def __init__(self):
+        self._settings = dict(DEFAULT_SETTINGS)
+        self._state = {}
+        self._busy = None
+        self._progress = {}
+
+    # ---------------------------------------------------------------- storage
+    def _ensure_dirs(self):
+        for path in (RUNTIME_DIR, SETTINGS_DIR, BIN_DIR, DATA_DIR, CACHE_DIR):
+            os.makedirs(path, exist_ok=True)
+
+    def _load_json(self, path, default):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else default
+        except Exception:
+            return default
+
+    def _save_json(self, path, data, mode=0o644):
+        _atomic_write(path, json.dumps(data, indent=2, ensure_ascii=False), mode)
+
+    def _load_settings(self):
+        self._ensure_dirs()
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update(self._load_json(SETTINGS_PATH, {}))
+        self._settings = merged
+        if not self._settings["source_path"]:
+            self._settings["source_path"] = USER_HOME
+        self._state = self._load_json(STATE_PATH, {})
+
+    def _save_settings(self):
+        self._save_json(SETTINGS_PATH, self._settings, 0o600)
+
+    def _save_state(self):
+        self._save_json(STATE_PATH, self._state, 0o600)
+
+    # ------------------------------------------------------------- config file
+    def _listen_addr(self) -> str:
+        return "0.0.0.0" if self._settings["listen_lan"] else "127.0.0.1"
+
+    def _url(self) -> str:
+        return "http://127.0.0.1:%d/" % int(self._settings["port"])
+
+    def _write_config(self):
+        """Regenerate config.yaml from settings (the file is plugin-owned)."""
+        s = self._settings
+        lines = [
+            "# Generated by the Decky plugin 'FileBrowser Quantum'.",
+            "# Changes are overwritten on every start; use the plugin settings.",
+            "http:",
+            "  port: %d" % int(s["port"]),
+            "  listen: %s" % _yaml_str(self._listen_addr()),
+            "server:",
+            "  disableUpdateCheck: true",
+            "  database:",
+            "    path: %s" % _yaml_str(os.path.join(DATA_DIR, "filebrowser.sqlite")),
+            "  cacheDir: %s" % _yaml_str(CACHE_DIR),
+            "  sources:",
+            "    - name: %s" % _yaml_str(s["source_name"] or "Steam Deck"),
+            "      path: %s" % _yaml_str(s["source_path"] or USER_HOME),
+            "      config:",
+            "        defaultEnabled: true",
+            "  logging:",
+            "    - levels: \"info|warning|error\"",
+            "      noColors: true",
+            "      output: \"stdout\"",
+            "auth:",
+            "  methods:",
+            "    noauth: %s" % ("true" if s["no_auth"] else "false"),
+            "    password:",
+            "      enabled: true",
+            "",
+        ]
+        _atomic_write(CONFIG_PATH, "\n".join(lines))
+        os.chmod(CONFIG_PATH, 0o644)
+
+    # ---------------------------------------------------------------- process
+    def _pid(self):
+        pid = (self._state or {}).get("pid")
+        return int(pid) if isinstance(pid, int) and pid > 0 else None
+
+    def _pid_alive(self, pid) -> bool:
+        if not pid:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            pass
+        except Exception:
+            return False
+        try:
+            return os.path.realpath("/proc/%d/exe" % pid) == os.path.realpath(BIN_PATH)
+        except Exception:
+            return True
+
+    def _find_instances(self):
+        """PIDs whose executable is our managed binary (adopts orphans)."""
+        found = []
+        target = os.path.realpath(BIN_PATH) if os.path.exists(BIN_PATH) else None
+        if not target:
+            return found
+        try:
+            entries = os.listdir("/proc")
+        except Exception:
+            return found
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            try:
+                if os.path.realpath("/proc/%s/exe" % entry) == target:
+                    found.append(int(entry))
+            except Exception:
+                continue
+        return found
+
+    def _running_pid(self):
+        pid = self._pid()
+        if self._pid_alive(pid):
+            return pid
+        instances = self._find_instances()
+        if instances:
+            self._state["pid"] = instances[0]
+            self._save_state()
+            return instances[0]
+        return None
+
+    def _probe(self) -> bool:
+        try:
+            req = urllib.request.Request(
+                self._url() + "health", headers={"User-Agent": UA}
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    def _port_free(self) -> bool:
+        addr = self._listen_addr()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((addr, int(self._settings["port"])))
+            return True
+        except OSError:
+            return False
+        finally:
+            sock.close()
+
+    def _detect_version(self):
+        if not os.path.exists(BIN_PATH):
+            return None
+        try:
+            out = subprocess.run(
+                [BIN_PATH, "version"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=RUNTIME_DIR,
+            )
+            text = (out.stdout or "") + (out.stderr or "")
+            m = re.search(r"Version\s*:\s*(\S+)", text)
+            if m:
+                return m.group(1)
+        except Exception as exc:
+            decky.logger.warning("version probe failed: %s" % exc)
+        return (self._state or {}).get("version")
+
+    def _deck_ids(self):
+        """When the loader runs us as root, the server must not create root-owned
+        files inside the deck user's home."""
+        if os.geteuid() != 0:
+            return None
+        try:
+            import pwd
+
+            pw = pwd.getpwnam(decky.DECKY_USER)
+            return (pw.pw_uid, pw.pw_gid)
+        except Exception:
+            return None
+
+    def _own(self, path):
+        ids = self._deck_ids()
+        if not ids or not os.path.exists(path):
+            return
+        uid, gid = ids
+        try:
+            os.chown(path, uid, gid)
+            for root_dir, dirs, files in os.walk(path):
+                for name in dirs + files:
+                    try:
+                        os.chown(os.path.join(root_dir, name), uid, gid)
+                    except OSError:
+                        pass
+        except OSError as exc:
+            decky.logger.warning("chown %s: %s" % (path, exc))
+
+    def _spawn(self):
+        log = open(LOG_PATH, "ab", buffering=0)
+        spawn_kwargs = {}
+        ids = self._deck_ids()
+        if ids:
+            uid, gid = ids
+
+            def _drop_privileges():
+                os.setgid(gid)
+                os.setuid(uid)
+
+            spawn_kwargs["preexec_fn"] = _drop_privileges
+        try:
+            proc = subprocess.Popen(
+                [BIN_PATH, "-c", CONFIG_PATH],
+                cwd=RUNTIME_DIR,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+                **spawn_kwargs,
+            )
+        finally:
+            log.close()
+        self._state["pid"] = proc.pid
+        self._state["started_at"] = _now()
+        self._save_state()
+        return proc.pid
+
+    def _terminate(self, pid, timeout=10) -> bool:
+        if not self._pid_alive(pid):
+            return True
+        for sig in (15, 9):
+            try:
+                os.killpg(pid, sig)
+            except ProcessLookupError:
+                return True
+            except Exception:
+                try:
+                    os.kill(pid, sig)
+                except Exception:
+                    pass
+            deadline = time.time() + (timeout if sig == 15 else 3)
+            while time.time() < deadline:
+                if not self._pid_alive(pid):
+                    return True
+                time.sleep(0.2)
+        return not self._pid_alive(pid)
+
+    def _stop_sync(self):
+        stopped = False
+        pid = self._running_pid()
+        if pid:
+            stopped = self._terminate(pid) or stopped
+        for other in self._find_instances():
+            stopped = self._terminate(other) or stopped
+        self._state.pop("pid", None)
+        self._state.pop("started_at", None)
+        self._save_state()
+        return True
+
+    # ------------------------------------------------------------- provisioning
+    def _admin_password(self) -> str:
+        if not self._settings.get("admin_password"):
+            self._settings["admin_password"] = _gen_password()
+            self._save_settings()
+        return self._settings["admin_password"]
+
+    def _set_admin(self, password: str):
+        """Create/update the admin account through the binary's own CLI."""
+        username = self._settings.get("admin_username") or "admin"
+        result = subprocess.run(
+            [
+                BIN_PATH,
+                "-c",
+                CONFIG_PATH,
+                "user",
+                "set",
+                username,
+                "--password=%s" % password,
+                "--admin",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=RUNTIME_DIR,
+        )
+        out = ((result.stdout or "") + (result.stderr or "")).strip()
+        if result.returncode != 0:
+            raise RuntimeError("user set failed: %s" % (out[-300:] or result.returncode))
+        decky.logger.info("admin account ready: %s" % out.splitlines()[-1:])
+
+    # --------------------------------------------------------------- github
+    def _github_releases(self):
+        req = urllib.request.Request(
+            "https://api.github.com/repos/%s/releases?per_page=30" % GITHUB_REPO,
+            headers={"User-Agent": UA, "Accept": "application/vnd.github+json"},
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _fetch_release(self):
+        releases = self._github_releases()
+        if not isinstance(releases, list):
+            raise RuntimeError("unexpected GitHub API response")
+        candidates = []
+        for rel in releases:
+            if rel.get("draft") or not rel.get("tag_name"):
+                continue
+            asset = next(
+                (
+                    a
+                    for a in rel.get("assets", [])
+                    if a.get("name", "").startswith(ASSET_PREFIX)
+                ),
+                None,
+            )
+            if not asset:
+                continue
+            candidates.append(
+                {
+                    "tag": rel.get("tag_name"),
+                    "name": asset.get("name"),
+                    "url": asset.get("browser_download_url"),
+                    "size": int(asset.get("size") or 0),
+                    "published_at": rel.get("published_at"),
+                    "prerelease": bool(rel.get("prerelease")),
+                    "notes": (rel.get("body") or "")[:500],
+                }
+            )
+        if not candidates:
+            raise RuntimeError("no release with a %s asset found upstream" % ASSET_PREFIX)
+        if self._settings.get("channel") == "latest":
+            return candidates[0]
+        stable = [c for c in candidates if "stable" in c["tag"].lower()]
+        if stable:
+            return stable[0]
+        for candidate in candidates:
+            if not candidate["prerelease"]:
+                return candidate
+        return candidates[0]
+
+    def _download(self, url: str, total: int):
+        self._progress = {
+            "phase": "download",
+            "downloaded": 0,
+            "total": total,
+            "percent": 0,
+        }
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        got = 0
+        with urllib.request.urlopen(req, timeout=60) as resp, open(TMP_DOWNLOAD, "wb") as out:
+            length = int(resp.headers.get("Content-Length") or total or 0)
+            self._progress["total"] = length
+            while True:
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                out.write(chunk)
+                got += len(chunk)
+                self._progress["downloaded"] = got
+                if length:
+                    self._progress["percent"] = round(got * 100.0 / length, 1)
+        self._progress["phase"] = "verify"
+        return got
+
+    def _install_from_release(self, rel):
+        os.makedirs(BIN_DIR, exist_ok=True)
+        if os.path.exists(TMP_DOWNLOAD):
+            os.remove(TMP_DOWNLOAD)
+        size = self._download(rel["url"], rel["size"])
+        if size < 5 * 1024 * 1024:
+            raise RuntimeError("download too small (%d bytes), aborted" % size)
+        with open(TMP_DOWNLOAD, "rb") as f:
+            if f.read(4) != b"\x7fELF":
+                raise RuntimeError("downloaded file is not an ELF binary")
+        os.chmod(TMP_DOWNLOAD, 0o755)
+        digest = _sha256(TMP_DOWNLOAD)
+        backup = BIN_PATH + ".old"
+        if os.path.exists(BIN_PATH):
+            shutil.copy2(BIN_PATH, backup)
+        os.replace(TMP_DOWNLOAD, BIN_PATH)
+        self._progress["phase"] = "configure"
+        self._state.update(
+            {
+                "version": rel["tag"],
+                "asset": rel["name"],
+                "sha256": digest,
+                "installed_at": _now(),
+                "published_at": rel["published_at"],
+            }
+        )
+        self._save_state()
+        self._write_config()
+        try:
+            self._set_admin(self._admin_password())
+        except Exception as exc:
+            decky.logger.warning("admin provisioning failed: %s" % exc)
+        for path in (BIN_DIR, DATA_DIR, CACHE_DIR, CONFIG_PATH, LOG_PATH):
+            self._own(path)
+        return rel
+
+    # ---------------------------------------------------------------- state
+    def _state_dict(self):
+        s = self._settings
+        pid = self._running_pid()
+        installed = os.path.exists(BIN_PATH)
+        running = bool(pid)
+        ready = running and self._probe()
+        latest = (self._state or {}).get("latest") or {}
+        current = (self._state or {}).get("version")
+        update_available = False
+        if latest.get("tag") and current:
+            update_available = _version_tuple(latest["tag"]) > _version_tuple(current)
+        return {
+            "plugin_version": PLUGIN_VERSION,
+            "installed": installed,
+            "running": running,
+            "ready": ready,
+            "pid": pid,
+            "version": current,
+            "latest_version": latest.get("tag"),
+            "latest_prerelease": bool(latest.get("prerelease")),
+            "update_available": update_available,
+            "last_check": (self._state or {}).get("last_check"),
+            "check_error": (self._state or {}).get("check_error"),
+            "url": self._url(),
+            "port": int(s["port"]),
+            "listen_lan": bool(s["listen_lan"]),
+            "source_path": s["source_path"],
+            "source_name": s["source_name"],
+            "admin_username": s["admin_username"],
+            "admin_password": s.get("admin_password", ""),
+            "no_auth": bool(s["no_auth"]),
+            "auto_start": bool(s["auto_start"]),
+            "channel": s.get("channel", "stable"),
+            "busy": self._busy,
+            "progress": dict(self._progress or {}),
+            "bin_size": os.path.getsize(BIN_PATH) if installed else 0,
+            "sha256": (self._state or {}).get("sha256"),
+            "log_path": LOG_PATH,
+            "port_free": self._port_free() if not running else True,
+        }
+
+    def _result(self, ok=True, message=""):
+        data = self._state_dict()
+        data["ok"] = ok
+        data["message"] = message
+        return data
+
+    def _fail(self, message):
+        return self._result(False, message)
+
+    # ---------------------------------------------------------------- checks
+    async def check_update(self, force: bool = True):
+        try:
+            rel = await asyncio.to_thread(self._fetch_release)
+        except Exception as exc:
+            self._state["check_error"] = str(exc)[:300]
+            self._state["last_check"] = _now()
+            self._save_state()
+            return self._fail("检查更新失败：%s" % exc)
+        self._state["latest"] = rel
+        self._state["check_error"] = None
+        self._state["last_check"] = _now()
+        self._save_state()
+        current = (self._state or {}).get("version")
+        if current and _version_tuple(rel["tag"]) <= _version_tuple(current):
+            return self._result(True, "已是最新版本 %s" % current)
+        return self._result(True, "发现新版本 %s" % rel["tag"])
+
+    # ---------------------------------------------------------------- actions
+    async def install(self, force: bool = False):
+        if self._busy:
+            return self._fail("正在忙：%s" % self._busy)
+        if os.path.exists(BIN_PATH) and not force:
+            return self._fail("已经安装，请使用检查更新")
+        if not self._settings.get("source_path") or not os.path.isdir(
+            self._settings["source_path"]
+        ):
+            return self._fail("共享目录不存在：%s" % self._settings.get("source_path"))
+        self._busy = "install"
+        self._progress = {"phase": "resolve", "percent": 0}
+        try:
+            rel = await asyncio.to_thread(self._fetch_release)
+            await asyncio.to_thread(self._install_from_release, rel)
+            self._state["latest"] = rel
+            self._save_state()
+            message = "已安装 %s" % rel["tag"]
+            if self._settings["auto_start"]:
+                message += "，" + (await self.start()).get("message", "")
+            return self._result(True, message)
+        except Exception as exc:
+            decky.logger.error("install failed: %s" % exc)
+            return self._fail("安装失败：%s" % exc)
+        finally:
+            self._busy = None
+            self._progress = {}
+
+    async def update(self):
+        if self._busy:
+            return self._fail("正在忙：%s" % self._busy)
+        if not os.path.exists(BIN_PATH):
+            return self._fail("尚未安装")
+        self._busy = "update"
+        self._progress = {"phase": "resolve", "percent": 0}
+        was_running = bool(self._running_pid())
+        try:
+            rel = await asyncio.to_thread(self._fetch_release)
+            current = (self._state or {}).get("version")
+            if current and _version_tuple(rel["tag"]) <= _version_tuple(current):
+                self._state["latest"] = rel
+                self._save_state()
+                return self._result(True, "已是最新版本 %s" % current)
+            if was_running:
+                await asyncio.to_thread(self._stop_sync)
+            await asyncio.to_thread(self._install_from_release, rel)
+            self._state["latest"] = rel
+            self._save_state()
+            message = "已升级到 %s" % rel["tag"]
+            if was_running:
+                message += "，" + (await self.start()).get("message", "")
+            return self._result(True, message)
+        except Exception as exc:
+            decky.logger.error("update failed: %s" % exc)
+            if was_running and not self._running_pid():
+                try:
+                    await self.start()
+                except Exception:
+                    pass
+            return self._fail("升级失败：%s" % exc)
+        finally:
+            self._busy = None
+            self._progress = {}
+
+    async def start(self):
+        if not os.path.exists(BIN_PATH):
+            return self._fail("尚未安装 FileBrowser Quantum")
+        pid = self._running_pid()
+        if pid:
+            return self._result(True, "已经在运行 (pid %d)" % pid)
+        self._write_config()
+        if not self._port_free():
+            return self._fail(
+                "端口 %d 已被其它程序占用，请在设置里换一个端口" % int(self._settings["port"])
+            )
+        try:
+            pid = await asyncio.to_thread(self._spawn)
+        except Exception as exc:
+            return self._fail("启动失败：%s" % exc)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if self._probe():
+                self._state["ready"] = True
+                self._save_state()
+                return self._result(True, "已启动：%s" % self._url())
+            if not self._pid_alive(pid):
+                break
+            await asyncio.sleep(0.5)
+        tail = self.get_logs(12).get("log", "")
+        self._state.pop("pid", None)
+        self._save_state()
+        return self._fail("启动超时或进程退出。\n%s" % tail)
+
+    async def stop(self):
+        if not self._running_pid():
+            return self._result(True, "本来就没在运行")
+        await asyncio.to_thread(self._stop_sync)
+        return self._result(True, "已停止")
+
+    async def restart(self):
+        await asyncio.to_thread(self._stop_sync)
+        await asyncio.sleep(0.5)
+        return await self.start()
+
+    async def reset_admin_password(self):
+        if not os.path.exists(BIN_PATH):
+            return self._fail("尚未安装")
+        self._settings["admin_password"] = _gen_password()
+        self._save_settings()
+        was_running = bool(self._running_pid())
+        try:
+            if was_running:
+                await asyncio.to_thread(self._stop_sync)
+            await asyncio.to_thread(self._set_admin, self._settings["admin_password"])
+            self._own(DATA_DIR)
+            if was_running:
+                await self.start()
+            return self._result(
+                True,
+                "新密码：%s（首次登录会要求再改一次）" % self._settings["admin_password"],
+            )
+        except Exception as exc:
+            return self._fail("重置密码失败：%s" % exc)
+
+    async def save_settings(self, patch: dict):
+        if not isinstance(patch, dict):
+            return self._fail("无效的设置")
+        restart_needed = False
+        for key in (
+            "port",
+            "listen_lan",
+            "source_path",
+            "source_name",
+            "admin_username",
+            "admin_password",
+            "no_auth",
+            "auto_start",
+            "channel",
+        ):
+            if key not in patch:
+                continue
+            value = patch[key]
+            if key == "port":
+                try:
+                    value = int(value)
+                except Exception:
+                    return self._fail("端口必须是数字")
+                if not 1024 <= value <= 65535:
+                    return self._fail("端口需在 1024-65535 之间")
+            elif key in ("listen_lan", "no_auth", "auto_start"):
+                value = bool(value)
+            else:
+                value = str(value)
+            if key == "source_name" and not value.strip():
+                value = "Steam Deck"
+            old = self._settings.get(key)
+            self._settings[key] = value
+            if old != value and key in ("port", "listen_lan", "source_path", "source_name", "no_auth"):
+                restart_needed = True
+        if not self._settings.get("admin_username"):
+            self._settings["admin_username"] = "admin"
+        self._save_settings()
+        self._write_config()
+        message = "设置已保存"
+        if restart_needed and self._running_pid():
+            state = await self.restart()
+            message = "设置已保存并重启：" + state.get("message", "")
+        if self._settings["no_auth"] and self._settings["listen_lan"]:
+            message += "（注意：免密 + 局域网 = 同网段任何人都能读写共享目录）"
+        return self._result(True, message)
+
+    async def open_ui(self):
+        url = self._url()
+        for cmd in (["steam", "steam://openurl/%s" % url], ["xdg-open", url]):
+            try:
+                subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                return self._result(True, url)
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+        return self._result(True, url)
+
+    def get_logs(self, lines: int = 80):
+        lines = max(1, min(int(lines or 80), MAX_LOG_TAIL))
+        text = ""
+        try:
+            size = os.path.getsize(LOG_PATH)
+            with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                if size > 200_000:
+                    f.seek(size - 200_000)
+                    text = f.read()
+                else:
+                    text = f.read()
+            text = "\n".join(text.splitlines()[-lines:])
+        except FileNotFoundError:
+            text = "(暂无日志)"
+        except Exception as exc:
+            text = "(读取日志失败: %s)" % exc
+        return {"ok": True, "log": text}
+
+    async def clear_data(self):
+        await asyncio.to_thread(self._stop_sync)
+        removed = []
+        for path in (DATA_DIR, CACHE_DIR, LOG_PATH, CONFIG_PATH, STATE_PATH):
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                elif os.path.exists(path):
+                    os.remove(path)
+                removed.append(os.path.basename(path))
+            except Exception as exc:
+                decky.logger.warning("cleanup %s: %s" % (path, exc))
+        self._ensure_dirs()
+        self._state = {k: v for k, v in self._state.items() if k in ("version", "asset", "sha256", "installed_at")}
+        self._save_state()
+        self._own(DATA_DIR)
+        return self._result(True, "已清除：%s" % ", ".join(removed))
+
+    async def get_state(self):
+        return self._state_dict()
+
+    # ------------------------------------------------------------- lifecycle
+    async def _main(self):
+        self._load_settings()
+        decky.logger.info(
+            "FileBrowser Quantum plugin up (runtime=%s, installed=%s)"
+            % (RUNTIME_DIR, os.path.exists(BIN_PATH))
+        )
+        if not self._settings.get("admin_password") and os.path.exists(BIN_PATH):
+            self._admin_password()
+        await asyncio.sleep(3)
+        if not os.path.exists(BIN_PATH):
+            return
+        if self._running_pid():
+            return
+        if self._settings.get("auto_start"):
+            state = await self.start()
+            if not state.get("ok"):
+                decky.logger.warning("auto start failed: %s" % state.get("message"))
+
+    async def _unload(self):
+        # The web server is a detached service: keep it alive when the plugin
+        # UI is reloaded, and only release the tracking state.
+        decky.logger.info("FileBrowser Quantum plugin unloaded, server left running")
+
+    async def _uninstall(self):
+        try:
+            self._load_settings()
+            self._stop_sync()
+            shutil.rmtree(BIN_DIR, ignore_errors=True)
+            shutil.rmtree(CACHE_DIR, ignore_errors=True)
+            decky.logger.info("binaries removed, user data kept in %s" % DATA_DIR)
+        except Exception as exc:
+            decky.logger.warning("uninstall cleanup: %s" % exc)
+
+    async def _migration(self):
+        pass
