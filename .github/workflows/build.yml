@@ -10,13 +10,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - name: dist/ must be committed
-        run: git diff --exit-code -- dist
+          cache: pnpm
+      - run: pnpm i --frozen-lockfile
+      - run: pnpm run build
+      - name: dist/ must be up to date
+        run: git diff --exit-code -- dist/index.js
       - name: python backend compiles
         run: python3 -m py_compile main.py
